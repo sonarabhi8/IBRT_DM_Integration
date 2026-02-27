@@ -1,0 +1,4 @@
+azure-functions
+pyodbc
+pandas
+azure-storage-blob
