@@ -18,7 +18,7 @@ venv/
 .azurefunctions/
 
 # IDE
-.vscode/
+
 .idea/
 *.swp
 *.swo
@@ -27,3 +27,5 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+.python_packages

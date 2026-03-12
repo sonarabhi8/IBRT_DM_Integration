@@ -1,4 +1,4 @@
 azure-functions
-pyodbc
+pymssql
 pandas
-azure-storage-blob
+azure-storage-file-share

@@ -1,57 +1,46 @@
 import azure.functions as func
 import logging
-import pyodbc
+import pymssql
 import pandas as pd
 from io import StringIO, BytesIO
 import os
 import json
 import gzip
-import uuid
-import base64
-from azure.storage.blob import BlobServiceClient, BlobBlock
+from azure.storage.fileshare import ShareServiceClient
 from datetime import datetime, timedelta
 
 bp = func.Blueprint()
 
-TRACKING_BLOB_NAME = "TimeTickets_last_run.json"
+TRACKING_FILE_NAME = "TimeTickets_last_run.json"
 CHUNK_SIZE = 100_000  # Rows per chunk - optimal for memory vs speed
 
 
-def get_last_run_info(blob_service_client, container_name):
-    """Read the last run tracking file from blob storage"""
+def get_last_run_info(share_client):
+    """Read the last run tracking file from file share"""
     try:
-        blob_client = blob_service_client.get_blob_client(
-            container=container_name, blob=TRACKING_BLOB_NAME
-        )
-        data = blob_client.download_blob().readall()
+        file_client = share_client.get_file_client(TRACKING_FILE_NAME)
+        data = file_client.download_file().readall()
         return json.loads(data)
     except Exception:
         return None
 
 
-def save_last_run_info(blob_service_client, container_name, run_info):
-    """Save the last run tracking file to blob storage"""
-    blob_client = blob_service_client.get_blob_client(
-        container=container_name, blob=TRACKING_BLOB_NAME
-    )
-    blob_client.upload_blob(json.dumps(run_info), overwrite=True)
+def save_last_run_info(share_client, run_info):
+    """Save the last run tracking file to file share"""
+    file_client = share_client.get_file_client(TRACKING_FILE_NAME)
+    content = json.dumps(run_info)
+    file_client.upload_file(content)
 
 
-def generate_block_id(index):
-    """Generate a unique block ID for block blob upload"""
-    block_id = f"block-{index:06d}"
-    return base64.b64encode(block_id.encode()).decode()
-
-
-def upload_chunked_to_blob(blob_client, query, conn, chunk_size):
+def upload_chunked_to_fileshare(file_client, query, conn, chunk_size):
     """
-    Read SQL data in chunks and upload to blob as a single gzipped CSV.
-    Uses Block Blob API to upload in parts without holding all data in memory.
+    Read SQL data in chunks and upload to file share as a single gzipped CSV.
+    Collects all compressed data in memory, then uploads once.
     """
-    block_list = []
     total_rows = 0
     chunk_index = 0
     header_written = False
+    all_gz_data = BytesIO()
 
     logging.info(f'Starting chunked read with chunk_size={chunk_size}')
 
@@ -69,24 +58,20 @@ def upload_chunked_to_blob(blob_client, query, conn, chunk_size):
         csv_data = csv_buffer.getvalue().encode('utf-8')
         header_written = True
 
-        # Gzip compress the chunk
+        # Gzip compress the chunk and append
         gz_buffer = BytesIO()
         with gzip.GzipFile(fileobj=gz_buffer, mode='wb') as gz:
             gz.write(csv_data)
-        gz_data = gz_buffer.getvalue()
-
-        # Upload as a block
-        block_id = generate_block_id(chunk_index)
-        blob_client.stage_block(block_id=block_id, data=gz_data, length=len(gz_data))
-        block_list.append(BlobBlock(block_id=block_id))
+        all_gz_data.write(gz_buffer.getvalue())
 
         chunk_index += 1
-        logging.info(f'Chunk {chunk_index} uploaded ({len(gz_data)} bytes compressed)')
+        logging.info(f'Chunk {chunk_index} processed ({len(gz_buffer.getvalue())} bytes compressed)')
 
-    # Commit all blocks as one blob
-    if block_list:
-        blob_client.commit_block_list(block_list)
-        logging.info(f'All {chunk_index} blocks committed. Total rows: {total_rows}')
+    # Upload all data to file share
+    if total_rows > 0:
+        all_gz_data.seek(0)
+        file_client.upload_file(all_gz_data.read())
+        logging.info(f'All {chunk_index} chunks uploaded. Total rows: {total_rows}')
 
     return total_rows, chunk_index
 
@@ -97,24 +82,25 @@ def export_time_tickets():
     - First run: Full load (chunked + compressed)
     - Subsequent runs: Delta load (last 14 days based on createdt)
     - Before 14 days: Raises RuntimeError
-    Returns: (total_rows, total_chunks, blob_name, container_name, load_type)
+    Returns: (total_rows, total_chunks, file_name, share_name, load_type)
     """
     sql_connection_string = os.environ.get('SQL_CONNECTION_STRING')
-    blob_connection_string = os.environ.get('BLOB_CONNECTION_STRING')
-    container_name = os.environ.get('BLOB_CONTAINER_NAME', 'ibrttest')
+    fileshare_connection_string = os.environ.get('FILESHARE_CONNECTION_STRING')
+    fileshare_name = os.environ.get('FILESHARE_NAME', 'ibrt-qa-generatecsv-share')
     table_name = "TimeTickets"
     delta_days = 14
 
     if not sql_connection_string:
         raise ValueError("SQL_CONNECTION_STRING not configured")
-    if not blob_connection_string:
-        raise ValueError("BLOB_CONNECTION_STRING not configured")
+    if not fileshare_connection_string:
+        raise ValueError("FILESHARE_CONNECTION_STRING not configured")
 
-    # Initialize blob service
-    blob_service_client = BlobServiceClient.from_connection_string(blob_connection_string)
+    # Initialize file share client
+    share_service_client = ShareServiceClient.from_connection_string(fileshare_connection_string)
+    share_client = share_service_client.get_share_client(fileshare_name)
 
     # Check last run info
-    last_run_info = get_last_run_info(blob_service_client, container_name)
+    last_run_info = get_last_run_info(share_client)
     now = datetime.now()
     is_first_run = last_run_info is None
 
@@ -132,9 +118,34 @@ def export_time_tickets():
                 f"Please wait {remaining_days} more day(s) to complete the 14-day interval."
             )
 
+    # Parse connection string for pymssql
+    conn_params = {}
+    for part in sql_connection_string.split(';'):
+        if '=' in part:
+            key, value = part.split('=', 1)
+            key = key.strip()
+            if key.upper() == 'SERVER':
+                # Handle server with port (format: server,port or server:port)
+                if ',' in value:
+                    server, port = value.split(',', 1)
+                    conn_params['server'] = server.strip()
+                    conn_params['port'] = int(port.strip())
+                elif ':' in value:
+                    server, port = value.split(':', 1)
+                    conn_params['server'] = server.strip()
+                    conn_params['port'] = int(port.strip())
+                else:
+                    conn_params['server'] = value.strip()
+            elif key.upper() == 'INITIAL CATALOG':
+                conn_params['database'] = value.strip()
+            elif key.upper() == 'USER ID':
+                conn_params['user'] = value.strip()
+            elif key.upper() == 'PASSWORD':
+                conn_params['password'] = value.strip()
+
     # Connect to SQL Server
     logging.info('Connecting to SQL Server...')
-    conn = pyodbc.connect(sql_connection_string)
+    conn = pymssql.connect(**conn_params)
 
     if is_first_run:
         logging.info(f'First run detected - performing FULL LOAD of {table_name}')
@@ -148,18 +159,16 @@ def export_time_tickets():
         query = f"SELECT * FROM {table_name} WHERE createdt >= '{delta_date}'"
         load_type = "DELTA_LOAD"
 
-    # Generate blob name with timestamp and load type
+    # Generate file name with timestamp and load type
     timestamp = now.strftime('%Y%m%d_%H%M%S')
-    blob_name = f"{table_name}_{load_type}_{timestamp}.csv.gz"
+    file_name = f"{table_name}_{load_type}_{timestamp}.csv.gz"
 
-    # Upload using chunked + compressed approach
-    logging.info(f'Uploading to Azure Blob Storage: {container_name}/{blob_name}')
-    blob_client = blob_service_client.get_blob_client(
-        container=container_name, blob=blob_name
-    )
+    # Upload using chunked + compressed approach to file share
+    logging.info(f'Uploading to Azure File Share: {fileshare_name}/{file_name}')
+    file_client = share_client.get_file_client(file_name)
 
-    total_rows, total_chunks = upload_chunked_to_blob(
-        blob_client, query, conn, CHUNK_SIZE
+    total_rows, total_chunks = upload_chunked_to_fileshare(
+        file_client, query, conn, CHUNK_SIZE
     )
     conn.close()
 
@@ -169,12 +178,12 @@ def export_time_tickets():
         'load_type': load_type,
         'rows_exported': total_rows,
         'chunks_uploaded': total_chunks,
-        'blob_name': blob_name
+        'file_name': file_name
     }
-    save_last_run_info(blob_service_client, container_name, run_info)
+    save_last_run_info(share_client, run_info)
 
     logging.info('Data successfully uploaded and tracking info saved.')
-    return total_rows, total_chunks, blob_name, container_name, load_type
+    return total_rows, total_chunks, file_name, fileshare_name, load_type
 
 
 # ============================================================
@@ -194,10 +203,10 @@ def time_tickets_timer(timer: func.TimerRequest) -> None:
         return
 
     try:
-        total_rows, total_chunks, blob_name, container, load_type = export_time_tickets()
+        total_rows, total_chunks, file_name, share_name, load_type = export_time_tickets()
         logging.info(
             f'SUCCESS! [{load_type}] Exported {total_rows:,} rows from TimeTickets '
-            f'in {total_chunks} chunks to {container}/{blob_name}'
+            f'in {total_chunks} chunks to {share_name}/{file_name}'
         )
     except RuntimeError as re:
         logging.warning(f'TimeTickets skipped: {str(re)}')
@@ -215,15 +224,15 @@ def time_tickets_http(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('TimeTickets HTTP triggered.')
 
     try:
-        total_rows, total_chunks, blob_name, container, load_type = export_time_tickets()
+        total_rows, total_chunks, file_name, share_name, load_type = export_time_tickets()
         return func.HttpResponse(
             f"Success! [{load_type}] Exported {total_rows:,} rows from TimeTickets "
-            f"in {total_chunks} chunks to {container}/{blob_name}",
+            f"in {total_chunks} chunks to {share_name}/{file_name}",
             status_code=200
         )
     except RuntimeError as re:
         return func.HttpResponse(str(re), status_code=400)
-    except pyodbc.Error as db_error:
+    except pymssql.Error as db_error:
         return func.HttpResponse(f"Database error: {str(db_error)}", status_code=500)
     except Exception as e:
         return func.HttpResponse(f"Error: {str(e)}", status_code=500)
